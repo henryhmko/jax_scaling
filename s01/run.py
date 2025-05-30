@@ -120,4 +120,57 @@ class OurModel(nn.Module):
 
 
 ## data loading ##
+def convert_to_ascii(string_array, max_length):
+  result = np.zeros((len(string_array), max_length), dtype=np.unit8)
+  for i, string in enumerate(string_array):
+    for j, char in enumerate(string):
+      if j >= SEQUENCE_LENGTH:
+        break
+      result[i,j] = char
+  return result
 
+def build_dataset():
+    # Construct a tf.data.Dataset
+    ds = tfds.load('lm1b', split='train', shuffle_files=False)
+
+    # Build your input pipeline
+    ds = ds.batch(BATCH_IN_SEQUENCES).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+def process_example(raw_example):
+    numpy_strings = raw_example['text'].numpy()
+    ascii_array_input = convert_to_ascii(numpy_strings, SEQUENCE_LENGTH)
+    ascii_array_output = 0 * np.empty_like(ascii_array_input)
+    ascii_array_output[:,0:SEQUENCE_LENGTH-1] = ascii_array_input[:, 1:SEQUENCE_LENGTH]
+    return {"input" : jnp.asarray(ascii_array_input), "output" : jnp.asarray(ascii_array_output)}
+
+
+def calculate_loss(params, example, model):
+   logits = model.apply(params, example["input"])
+   n_classes = logits.shape[-1]
+   loss = optax.softmax_cross_entropy(logits, jax.nn.one_hot(example["output"], n_classes)).mean()
+   return loss
+
+def main():
+   rngkey = jax.random.key(0)
+   ds = build_dataset()
+   model = OurModel()
+   tx = optax.adam(learning_rate=LEARNING_RATE)
+   params = model.init(rngkey, jax.numpy.ones((BATCH_IN_SEQUENCES, SEQUENCE_LENGTH), dtype=jnp.int8))
+   
+   state = train_state.TrainState.create(
+      apply_fn=model.apply,
+      params=params,
+      tx=tx # optimizer
+   )
+
+   step = 0
+   for raw_example in ds:
+      example = process_example(raw_example)
+      loss, grad = jax.value_and_grad(calculate_loss, argnums=0)(state.params, example, model) # create a func that evaluates both calc_loss and gradient of it where calc_loss is the func to be differentiated
+      state = state.apply_gradients(grads=grad) # updates step, params, opt_state, **kwargs in return value
+      print(f"{step=}, {float(loss)=}")
+      step += 1
+
+if __name__ == "__main__":
+   main()
