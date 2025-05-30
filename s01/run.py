@@ -12,7 +12,7 @@ import numpy as np
 import optax
 
 # HYPERPARAMETERS
-BATCH_IN_SEQUENCES = 256
+BATCH_IN_SEQUENCES = 384
 SEQUENCE_LENGTH = 128
 
 VOCAB_DIM = 256
@@ -28,7 +28,7 @@ LEARNING_RATE = 1e-3
 
 class OurModel(nn.Module):
   @nn.compact # alternative to setup() approach
-  def __call__(self, input_tokens):
+  def __call__(self, x):
     '''
     input_tokens is [BATCH, SEQUENCE]
     '''
@@ -39,89 +39,35 @@ class OurModel(nn.Module):
       jnp.float32,                # dtype
     )
 
-    x = jnp.asarray(embedding)[input_tokens] #BATCH, SEQUENCE, EMBED
-
-    pos_embedding = self.param(
-      'pos_embedding',
-      nn.initializers.normal(1),
-      (1, SEQUENCE_LENGTH, EMBED_DIM),
-      jnp.float32,
-    )
-
-    x += jnp.asarray(pos_embedding) # BATCH, SEQUENCE, EMBED
+    x = embedding[x] #BATCH, SEQUENCE, EMBED
+    # x = jnp.asarray(embedding)[input_tokens] #BATCH, SEQUENCE, EMBED
 
     for i in range(LAYERS):
-      layer_input = x
-      emb2ff = self.param(
-        'emb2ff_' + str(i),
-        nn.initalizers.lecun_normal(),
+      feedforward = self.param(
+        'feedforward' + str(i),
+        nn.initializers.lecun_normal(),
         (EMBED_DIM, FF_DIM),
         jnp.float32,
       )
 
-      x = x @ jnp.asarray(emb2ff) # [B,S,E] @ [E, F] = [BATCH, SEQUENCE, FF_DIM]
+      x = x @ feedforward # [B,S,E] @ [E, F] = [BATCH, SEQUENCE, FF_DIM]
       x = jax.nn.relu(x)  # why jax.nn.relu instead of flax.linen.relu?
-      ff2emb = self.param(
-        'ff2emb_' + str(i),
+      embed = self.param(
+        'embed_' + str(i),
         nn.initializers.lecun_normal(),
         (FF_DIM, EMBED_DIM),
         jnp.float32,
       )
-      x = x @ jnp.asarray(ff2emb)
+      x = x @ embed
       x = jax.nn.relu(x)
 
-      q_proj = self.param(
-        'q_proj_' + str(i),
-        nn.initializers.lecun_normal(),
-        (EMBED_DIM, NUM_HEADS, HEAD_DEPTH),
-        jnp.float32,
-      )
-      q = jnp.einsum("BSE,END->BSND", x, jnp.asarray(q_proj)) # [BSE] @ [END] = [BSND]
-      
-      k_proj = self.param(
-        'k_proj_' + str(i),
-        nn.initializers.lecun_normal(),
-        (EMBED_DIM, NUM_HEADS, HEAD_DEPTH),
-        jnp.float32,
-      )
-      k = jnp.einsum("BSE,END->BSND", x, jnp.asarray(k_proj)) # [BSE] @ [END] = [BSND]
-      
-      v_proj = self.param(
-        'v_proj_' + str(i),
-        nn.initializers.lecun_normal(),
-        (EMBED_DIM, NUM_HEADS, HEAD_DEPTH),
-        jnp.float32,
-      )
-      v = jnp.einsum("BSE,END->BSND", x, jnp.asarray(v_proj))
-
-      post_attention = attention.dot_product_attention(q, k, v) # this is cheating but let it slide rn
-      post_attention = jax.numpy.reshape(post_attention, (BATCH_IN_SEQUENCES, SEQUENCE_LENGTH, NUM_HEADS * HEAD_DEPTH))
-
-      out_proj = self.param(
-        'out_proj_' + str(i),
-        nn.initializers.lecun_normal(),
-        (NUM_HEADS * HEAD_DEPTH, EMBED_DIM),
-        jnp.float32,
-      )
-
-      x = post_attention @ jnp.asarray(out_proj) # [BATCH_IN_SEQUENCES, SEQUENCE_LENGTH, NUM_HEADS * HEAD_DEPTH] @ [NUM_HEADS * HEAD_DEPTH, EMBED_DIM] = [BATCH_IN_SEQUENCES, SEQUENCE_LENGTH, EMBED_DIM]
-      x += layer_input # residual connection
-
-    emb2vocab = self.param(
-      'emb2vocab' + str(i),
-      nn.initializers.lecun_normal(),
-      (EMBED_DIM, VOCAB_DIM),
-      jnp.float32,
-    )
-
-    x = x @ jnp.asarray(emb2vocab) # [BATCH_IN_SEQUENCES, SEQUENCE_LENGTH, EMBED_DIM] @ [EMBED_DIM, VOCAB_DIM] = [BATCH_IN_SEQUENCES, SEQUENCE_LENGTH, VOCAB_DIM]
-    return x
+    return x @ embedding.T
 
 
 
 ## data loading ##
 def convert_to_ascii(string_array, max_length):
-  result = np.zeros((len(string_array), max_length), dtype=np.unit8)
+  result = np.zeros((len(string_array), max_length), dtype=np.uint8)
   for i, string in enumerate(string_array):
     for j, char in enumerate(string):
       if j >= SEQUENCE_LENGTH:
@@ -129,12 +75,17 @@ def convert_to_ascii(string_array, max_length):
       result[i,j] = char
   return result
 
+def input_to_output(np_array):
+   zero_array = np.zeros( (BATCH_IN_SEQUENCES,SEQUENCE_LENGTH), dtype = jnp.uint8)
+   zero_array[:, 1:SEQUENCE_LENGTH] = np_array[:, 0:SEQUENCE_LENGTH-1]
+   return zero_array
+
 def build_dataset():
     # Construct a tf.data.Dataset
     ds = tfds.load('lm1b', split='train', shuffle_files=False)
 
     # Build your input pipeline
-    ds = ds.batch(BATCH_IN_SEQUENCES).prefetch(tf.data.AUTOTUNE)
+    ds = ds.batch(BATCH_IN_SEQUENCES)
     return ds
 
 def process_example(raw_example):
@@ -145,31 +96,33 @@ def process_example(raw_example):
     return {"input" : jnp.asarray(ascii_array_input), "output" : jnp.asarray(ascii_array_output)}
 
 
-def calculate_loss(params, example, model):
-   logits = model.apply(params, example["input"])
-   n_classes = logits.shape[-1]
-   loss = optax.softmax_cross_entropy(logits, jax.nn.one_hot(example["output"], n_classes)).mean()
-   return loss
+def calculate_loss(params, model, inputs, outputs):
+   proposed_outputs = model.apply(params, inputs)
+   one_hot = jax.nn.one_hot(outputs, VOCAB_DIM)
+   loss = optax.softmax_cross_entropy(proposed_outputs, one_hot)
+   return jnp.mean(loss)
 
 def main():
    rngkey = jax.random.key(0)
    ds = build_dataset()
    model = OurModel()
    tx = optax.adam(learning_rate=LEARNING_RATE)
-   params = model.init(rngkey, jax.numpy.ones((BATCH_IN_SEQUENCES, SEQUENCE_LENGTH), dtype=jnp.int8))
+   _params = model.init(rngkey, jnp.ones((BATCH_IN_SEQUENCES, SEQUENCE_LENGTH), dtype=jnp.uint8))
    
    state = train_state.TrainState.create(
       apply_fn=model.apply,
-      params=params,
+      params=_params,
       tx=tx # optimizer
    )
 
    step = 0
-   for raw_example in ds:
-      example = process_example(raw_example)
-      loss, grad = jax.value_and_grad(calculate_loss, argnums=0)(state.params, example, model) # create a func that evaluates both calc_loss and gradient of it where calc_loss is the func to be differentiated
+   for example in ds:
+      outputs = convert_to_ascii(example['text'].numpy(), SEQUENCE_LENGTH)
+      inputs = input_to_output(outputs)
+      
+      loss, grad = jax.value_and_grad(calculate_loss)(state.params, model, inputs, outputs) # create a func that evaluates both calc_loss and gradient of it where calc_loss is the func to be differentiated
       state = state.apply_gradients(grads=grad) # updates step, params, opt_state, **kwargs in return value
-      print(f"{step=}, {float(loss)=}")
+      print(f"{step=}, {loss}")
       step += 1
 
 if __name__ == "__main__":
